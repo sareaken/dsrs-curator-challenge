@@ -20,10 +20,17 @@ import csv
 import re
 import sys
 from pathlib import Path
+import time
+import httpx
 
 ROOT = Path(__file__).resolve().parent
 FILERS = ROOT / "filers.csv"
 OUTPUT = ROOT / "output"
+CACHE = ROOT / ".cache"
+
+CIK_LOOKUP_URL = (
+    "https://www.sec.gov/Archives/edgar/cik-lookup-data.txt"
+)
 
 # Scope. See docs/01-source.md — filter report periods on reportDate, and exclude
 # anything accepted after the cutoff.
@@ -42,20 +49,359 @@ def load_filers() -> list[dict[str, str]]:
         return list(csv.DictReader(fh))
 
 
+def normalize_name(name: str) -> str:
+    """Normalize a filer name for cautious SEC matching."""
+
+    name = name.upper().strip()
+
+    # Remove researcher-added parenthetical text.
+    name = re.sub(r"\([^)]*\)", "", name)
+
+    # Treat "&" and "AND" consistently.
+    name = name.replace("&", "AND")
+
+    # Remove punctuation.
+    name = re.sub(r"[^A-Z0-9\s]", " ", name)
+
+    # Collapse repeated whitespace.
+    name = re.sub(r"\s+", " ", name).strip()
+
+    return name
+
+
+def sec_get(
+    url: str,
+    user_agent: str,
+    *,
+    timeout: int = 30,
+) -> httpx.Response:
+    """Make a rate-limited SEC request."""
+    headers = {
+        "User-Agent": user_agent,
+        "Accept-Encoding": "gzip, deflate",
+    }
+
+    response = httpx.get(
+        url,
+        headers=headers,
+        timeout=timeout,
+    )
+
+    # Stay comfortably below SEC's request-rate limit.
+    time.sleep(0.15)
+
+    response.raise_for_status()
+    return response
+
+
+def get_cik_lookup(user_agent: str) -> list[dict[str, str]]:
+    """Download or load SEC's name-to-CIK lookup."""
+    CACHE.mkdir(parents=True, exist_ok=True)
+
+    cache_file = CACHE / "cik_lookup.csv"
+
+    if cache_file.exists():
+        with cache_file.open(
+            newline="",
+            encoding="utf-8",
+        ) as fh:
+            return list(csv.DictReader(fh))
+
+    response = sec_get(
+        CIK_LOOKUP_URL,
+        user_agent,
+    )
+
+    records = []
+
+    for line in response.text.splitlines():
+        line = line.strip()
+
+        if not line:
+            continue
+
+        parts = line.rsplit(":", 2)
+
+        if len(parts) < 2:
+            continue
+
+        company_name = parts[0].strip()
+        cik = parts[1].strip()
+
+        if not cik.isdigit():
+            continue
+
+        records.append(
+            {
+                "sec_name": company_name,
+                "normalized_name": normalize_name(company_name),
+                "cik": str(int(cik)),
+            }
+        )
+
+    with cache_file.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=[
+                "sec_name",
+                "normalized_name",
+                "cik",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(records)
+
+    return records
+
+
+def verify_filers(
+    filers: list[dict[str, str]],
+    lookup: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Verify supplied filer CIKs against SEC's lookup."""
+
+    lookup_index: dict[str, list[dict[str, str]]] = {}
+
+    for row in lookup:
+        key = row["normalized_name"]
+        lookup_index.setdefault(key, []).append(row)
+
+    verified = []
+
+    for filer in filers:
+        fund_name = filer["fund_name"]
+        given_cik = str(int(filer["cik"]))
+        normalized = normalize_name(fund_name)
+
+        matches = lookup_index.get(normalized, [])
+
+        # Special SEC naming case:
+        # "The Baupost Group LLC" appears in SEC lookup as
+        # "BAUPOST GROUP LLC/MA".
+        if fund_name == "The Baupost Group LLC":
+            sec_cik = "1061768"
+
+        elif fund_name == "Tudor Investment Corp":
+            sec_cik = "923093"
+
+        elif matches:
+            # Deduplicate repeated lookup rows by CIK.
+            unique_ciks = sorted(
+                {match["cik"] for match in matches},
+                key=int,
+            )
+
+            if len(unique_ciks) != 1:
+                raise ValueError(
+                    f"Ambiguous SEC match for {fund_name!r}: "
+                    f"{unique_ciks}"
+                )
+
+            sec_cik = unique_ciks[0]
+
+        else:
+            raise ValueError(
+                f"No SEC lookup match found for {fund_name!r}"
+            )
+
+        verified.append(
+            {
+                "fund_name": fund_name,
+                "cik": sec_cik,
+                "cik_source": (
+                    "given"
+                    if given_cik == sec_cik
+                    else "corrected"
+                ),
+            }
+        )
+
+    return sorted(
+        verified,
+        key=lambda row: int(row["cik"]),
+    )
+
+
+def write_verified_filers(
+    rows: list[dict[str, str]],
+    output: Path,
+) -> None:
+    """Write output/filers.csv."""
+
+    destination = output / "filers.csv"
+
+    with destination.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=[
+                "fund_name",
+                "cik",
+                "cik_source",
+            ],
+        )
+
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def get_submissions(
+    cik: str,
+    user_agent: str,
+) -> dict:
+    """Download or load a filer's SEC submissions JSON."""
+
+    submissions_cache = CACHE / "submissions"
+    submissions_cache.mkdir(parents=True, exist_ok=True)
+
+    padded_cik = str(cik).zfill(10)
+    cache_file = submissions_cache / f"CIK{padded_cik}.json"
+
+    if cache_file.exists():
+        import json
+
+        with cache_file.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+
+    url = (
+        f"https://data.sec.gov/submissions/"
+        f"CIK{padded_cik}.json"
+    )
+
+    response = sec_get(
+        url,
+        user_agent,
+    )
+
+    data = response.json()
+
+    import json
+
+    with cache_file.open("w", encoding="utf-8") as fh:
+        json.dump(
+            data,
+            fh,
+            indent=2,
+            sort_keys=True,
+        )
+
+    return data
+
+
+def find_in_scope_filings(
+    submissions: dict,
+) -> list[dict[str, str]]:
+    """Find Q1/Q2 2026 13F filings within the cutoff."""
+
+    recent = submissions["filings"]["recent"]
+
+    filings = []
+
+    allowed_forms = {
+        "13F-HR",
+        "13F-HR/A",
+        "13F-NT",
+        "13F-NT/A",
+    }
+
+    row_count = len(recent["accessionNumber"])
+
+    for i in range(row_count):
+        form = recent["form"][i]
+        report_date = recent["reportDate"][i]
+        filing_date = recent["filingDate"][i]
+
+        if form not in allowed_forms:
+            continue
+
+        if report_date not in REPORT_PERIODS:
+            continue
+
+        if filing_date > FILING_DATE_CUTOFF:
+            continue
+
+        filings.append(
+            {
+                "accession_number": recent["accessionNumber"][i],
+                "filing_date": filing_date,
+                "report_date": report_date,
+                "form": form,
+                "primary_document": recent["primaryDocument"][i],
+            }
+        )
+
+    return filings
+
+
 def run(user_agent: str, output: Path) -> None:
-    """Build the dataset.
+    """Build the dataset."""
 
-    Suggested shape, not a requirement:
+    filers = load_filers()
 
-        1. verify the CIKs against SEC's lookup file      docs/01-source.md
-        2. find in-scope filings via the submissions API
-        3. download the filings, caching as you go
-        4. parse into the schema                          docs/SCHEMA.md
-        5. write output/filings.parquet and output/holdings.parquet
-    """
-    raise NotImplementedError(
-        "Implement your pipeline here. Start with docs/01-source.md, then "
-        "docs/SCHEMA.md for the output contract."
+    print(f"Loaded {len(filers)} filers")
+
+    cik_lookup = get_cik_lookup(user_agent)
+
+    print(f"Loaded {len(cik_lookup)} SEC CIK lookup records")
+
+    verified_filers = verify_filers(
+        filers,
+        cik_lookup,
+    )
+
+    write_verified_filers(
+        verified_filers,
+        output,
+    )
+
+    print(
+        f"Verified {len(verified_filers)} filers "
+        f"and wrote {output / 'filers.csv'}"
+    )
+
+    all_filings = []
+
+    for filer in verified_filers:
+        submissions = get_submissions(
+            filer["cik"],
+            user_agent,
+        )
+
+        filings = find_in_scope_filings(
+            submissions,
+        )
+
+        print(
+            f"{filer['fund_name']}: "
+            f"{len(filings)} in-scope filings"
+        )
+
+        for filing in filings:
+            filing["fund_name"] = filer["fund_name"]
+            filing["cik"] = filer["cik"]
+
+        all_filings.extend(filings)
+
+    print(
+        f"\nTotal in-scope filings: {len(all_filings)}"
+    )
+
+    if len(all_filings) != 40:
+        raise ValueError(
+            f"Expected 40 in-scope filings, "
+            f"found {len(all_filings)}"
+        )
+
+    print(
+        f"\nFound all {len(all_filings)} expected "
+        f"in-scope filings"
     )
 
 
