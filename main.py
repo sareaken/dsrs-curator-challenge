@@ -22,6 +22,11 @@ import sys
 from pathlib import Path
 import time
 import httpx
+from datetime import datetime
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+from lxml import etree
 
 ROOT = Path(__file__).resolve().parent
 FILERS = ROOT / "filers.csv"
@@ -340,6 +345,590 @@ def find_in_scope_filings(
     return filings
 
 
+def download_information_table(
+    filing: dict[str, str],
+    user_agent: str,
+    output: Path,
+) -> Path:
+    """Download a filing's 13F XML document."""
+
+    cik = filing["cik"]
+    accession = filing["accession_number"]
+    accession_nodashes = accession.replace("-", "")
+
+    filing_dir_url = (
+        f"https://www.sec.gov/Archives/edgar/data/"
+        f"{cik}/{accession_nodashes}"
+    )
+
+    index_url = f"{filing_dir_url}/index.json"
+
+    index_response = sec_get(
+        index_url,
+        user_agent,
+    )
+
+    index_data = index_response.json()
+
+    xml_candidates = []
+
+    for item in index_data["directory"]["item"]:
+        name = item.get("name", "")
+
+        if name.lower().endswith(".xml"):
+            xml_candidates.append(name)
+
+    form = filing["form"]
+
+    if form in {"13F-NT", "13F-NT/A"}:
+        # Notice filings have no holdings information table.
+        # Save the primary XML document instead.
+        primary_candidates = [
+            name
+            for name in xml_candidates
+            if name.lower() == "primary_doc.xml"
+        ]
+
+        if len(primary_candidates) != 1:
+            raise ValueError(
+                f"Expected primary_doc.xml for notice filing "
+                f"{accession}, found: {xml_candidates}"
+            )
+
+        source_filename = primary_candidates[0]
+
+    else:
+        # 13F-HR filings normally contain primary_doc.xml
+        # plus a separate holdings information-table XML.
+        info_candidates = [
+            name
+            for name in xml_candidates
+            if name.lower() != "primary_doc.xml"
+        ]
+
+        if len(info_candidates) != 1:
+            raise ValueError(
+                f"Expected exactly one non-primary XML "
+                f"for {accession}, found: {xml_candidates}"
+            )
+
+        source_filename = info_candidates[0]
+
+    destination_dir = output / "filings" / cik
+    destination_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    destination = (
+        destination_dir
+        / f"{accession_nodashes}.xml"
+    )
+
+    # Reuse a file we've already downloaded.
+    if destination.exists():
+        return destination
+
+    xml_url = f"{filing_dir_url}/{source_filename}"
+
+    xml_response = sec_get(
+        xml_url,
+        user_agent,
+    )
+
+    destination.write_bytes(
+        xml_response.content
+    )
+
+    return destination
+
+
+def get_filing_documents(
+    filing: dict[str, str],
+    user_agent: str,
+) -> tuple[Path, Path | None]:
+    """Fetch/cache cover page and information-table XML for one filing."""
+
+    cik = filing["cik"]
+    accession = filing["accession_number"]
+    accession_nodashes = accession.replace("-", "")
+
+    filing_dir_url = (
+        f"https://www.sec.gov/Archives/edgar/data/"
+        f"{cik}/{accession_nodashes}"
+    )
+
+    filing_cache = (
+        CACHE
+        / "filings"
+        / cik
+        / accession_nodashes
+    )
+    filing_cache.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # ----------------------------
+    # Cache index.json
+    # ----------------------------
+
+    index_path = filing_cache / "index.json"
+
+    if index_path.exists():
+        import json
+
+        with index_path.open(
+            "r",
+            encoding="utf-8",
+        ) as fh:
+            index_data = json.load(fh)
+
+    else:
+        index_response = sec_get(
+            f"{filing_dir_url}/index.json",
+            user_agent,
+        )
+
+        index_data = index_response.json()
+
+        import json
+
+        with index_path.open(
+            "w",
+            encoding="utf-8",
+        ) as fh:
+            json.dump(
+                index_data,
+                fh,
+                indent=2,
+                sort_keys=True,
+            )
+
+    xml_files = [
+        item["name"]
+        for item in index_data["directory"]["item"]
+        if item.get("name", "").lower().endswith(".xml")
+    ]
+
+    # ----------------------------
+    # Cover page
+    # ----------------------------
+
+    primary_candidates = [
+        name
+        for name in xml_files
+        if name.lower() == "primary_doc.xml"
+    ]
+
+    if len(primary_candidates) != 1:
+        raise ValueError(
+            f"Expected one primary_doc.xml for "
+            f"{accession}, found: {xml_files}"
+        )
+
+    primary_filename = primary_candidates[0]
+
+    primary_path = filing_cache / "primary_doc.xml"
+
+    if not primary_path.exists():
+        response = sec_get(
+            f"{filing_dir_url}/{primary_filename}",
+            user_agent,
+        )
+
+        primary_path.write_bytes(
+            response.content
+        )
+
+    # ----------------------------
+    # Information table
+    # ----------------------------
+
+    if filing["form"] in {"13F-NT", "13F-NT/A"}:
+        info_path = None
+
+    else:
+        info_candidates = [
+            name
+            for name in xml_files
+            if name.lower() != "primary_doc.xml"
+        ]
+
+        if len(info_candidates) != 1:
+            raise ValueError(
+                f"Expected one information-table XML "
+                f"for {accession}, found: {xml_files}"
+            )
+
+        info_filename = info_candidates[0]
+
+        info_path = filing_cache / "information_table.xml"
+
+        if not info_path.exists():
+            response = sec_get(
+                f"{filing_dir_url}/{info_filename}",
+                user_agent,
+            )
+
+            info_path.write_bytes(
+                response.content
+            )
+
+    return primary_path, info_path
+
+
+def local_name(element) -> str | None:
+    """Return an XML element's local name, skipping comments/PIs."""
+    if not isinstance(element.tag, str):
+        return None
+
+    return etree.QName(element).localname
+
+
+def find_first_text(
+    element,
+    name: str,
+) -> str | None:
+    """Return text from the first descendant with the given local name."""
+
+    for child in element.iter():
+        if local_name(child) == name:
+            if child.text is None:
+                return None
+
+            value = child.text.strip()
+
+            return value if value else None
+
+    return None
+
+
+def find_direct_child_text(
+    element,
+    name: str,
+) -> str | None:
+    """Return text from a direct child matching a local name."""
+
+    for child in element:
+        if local_name(child) == name:
+            if child.text is None:
+                return None
+
+            value = child.text.strip()
+
+            return value if value else None
+
+    return None
+
+
+def parse_int(value: str | None) -> int | None:
+    """Parse an optional integer, tolerating commas."""
+
+    if value is None:
+        return None
+
+    return int(value.replace(",", "").strip())
+
+
+def parse_filing_cover(
+    filing: dict[str, str],
+    primary_path: Path,
+) -> dict:
+    """Parse one filing's cover-page XML."""
+
+    tree = etree.parse(str(primary_path))
+    root = tree.getroot()
+
+    report_period_text = find_first_text(
+        root,
+        "reportCalendarOrQuarter",
+    )
+
+    if report_period_text is None:
+        raise ValueError(
+            f"Missing reportCalendarOrQuarter for "
+            f"{filing['accession_number']}"
+        )
+
+    report_period = datetime.strptime(
+        report_period_text,
+        "%m-%d-%Y",
+    ).date()
+
+    quarter = ((report_period.month - 1) // 3) + 1
+
+    filing_date = datetime.strptime(
+        filing["filing_date"],
+        "%Y-%m-%d",
+    ).date()
+
+    form_type = filing["form"]
+    is_amendment = form_type.endswith("/A")
+
+    filing_manager = find_first_text(
+        root,
+        "filingManager",
+    )
+
+    # filingManager itself contains a child <name>,
+    # so retrieve that specifically.
+    for element in root.iter():
+        if local_name(element) == "filingManager":
+            filing_manager = find_direct_child_text(
+                element,
+                "name",
+            )
+            break
+
+    if filing_manager is None:
+        raise ValueError(
+            f"Missing filing manager for "
+            f"{filing['accession_number']}"
+        )
+
+    return {
+        "accession_number": filing["accession_number"],
+        "cik": filing["cik"].zfill(10),
+        "fund_name": filing["fund_name"],
+        "filing_manager": filing_manager,
+        "form_type": form_type,
+        "report_period": report_period,
+        "report_quarter": (
+            f"{report_period.year}Q{quarter}"
+        ),
+        "filing_date": filing_date,
+        "is_amendment": is_amendment,
+
+        # We'll populate amendment-specific values if one appears.
+        "amendment_no": (
+            parse_int(find_first_text(root, "amendmentNo"))
+            if is_amendment
+            else None
+        ),
+        "amendment_type": (
+            find_first_text(root, "amendmentType")
+            if is_amendment
+            else None
+        ),
+
+        "report_type": find_first_text(
+            root,
+            "reportType",
+        ),
+        "form_13f_file_number": find_first_text(
+            root,
+            "form13FFileNumber",
+        ),
+        "crd_number": find_first_text(
+            root,
+            "crdNumber",
+        ),
+        "sec_file_number": find_first_text(
+            root,
+            "secFileNumber",
+        ),
+        "other_included_managers_count": parse_int(
+            find_first_text(
+                root,
+                "otherIncludedManagersCount",
+            )
+        ),
+        "table_entry_total": parse_int(
+            find_first_text(
+                root,
+                "tableEntryTotal",
+            )
+        ),
+        "table_value_total": parse_int(
+            find_first_text(
+                root,
+                "tableValueTotal",
+            )
+        ),
+    }
+
+
+def parse_holdings(
+    filing_row: dict,
+    info_path: Path | None,
+) -> list[dict]:
+    """Parse all positions from one 13F information table."""
+
+    # 13F-NT filings intentionally have no holdings.
+    if info_path is None:
+        return []
+
+    tree = etree.parse(str(info_path))
+    root = tree.getroot()
+
+    holdings = []
+
+    for element in root.iter():
+        if local_name(element) != "infoTable":
+            continue
+
+        shrs_or_prn = None
+        voting_authority = None
+
+        for child in element:
+            child_name = local_name(child)
+
+            if child_name == "shrsOrPrnAmt":
+                shrs_or_prn = child
+
+            elif child_name == "votingAuthority":
+                voting_authority = child
+
+        if shrs_or_prn is None:
+            raise ValueError(
+                f"Missing shrsOrPrnAmt in "
+                f"{filing_row['accession_number']}"
+            )
+
+        if voting_authority is None:
+            raise ValueError(
+                f"Missing votingAuthority in "
+                f"{filing_row['accession_number']}"
+            )
+
+        cusip = find_direct_child_text(
+            element,
+            "cusip",
+        )
+
+        if cusip is None or len(cusip) != 9:
+            raise ValueError(
+                f"Invalid CUSIP {cusip!r} in "
+                f"{filing_row['accession_number']}"
+            )
+
+        holdings.append(
+            {
+                "accession_number": (
+                    filing_row["accession_number"]
+                ),
+                "cik": filing_row["cik"],
+                "report_quarter": (
+                    filing_row["report_quarter"]
+                ),
+                "name_of_issuer": (
+                    find_direct_child_text(
+                        element,
+                        "nameOfIssuer",
+                    )
+                ),
+                "title_of_class": (
+                    find_direct_child_text(
+                        element,
+                        "titleOfClass",
+                    )
+                ),
+                "cusip": cusip,
+                "figi": find_direct_child_text(
+                    element,
+                    "figi",
+                ),
+                "value": parse_int(
+                    find_direct_child_text(
+                        element,
+                        "value",
+                    )
+                ),
+                "ssh_prnamt": parse_int(
+                    find_direct_child_text(
+                        shrs_or_prn,
+                        "sshPrnamt",
+                    )
+                ),
+                "ssh_prnamt_type": (
+                    find_direct_child_text(
+                        shrs_or_prn,
+                        "sshPrnamtType",
+                    )
+                ),
+                "put_call": find_direct_child_text(
+                    element,
+                    "putCall",
+                ),
+                "investment_discretion": (
+                    find_direct_child_text(
+                        element,
+                        "investmentDiscretion",
+                    )
+                ),
+                "other_manager": (
+                    find_direct_child_text(
+                        element,
+                        "otherManager",
+                    )
+                ),
+                "voting_sole": parse_int(
+                    find_direct_child_text(
+                        voting_authority,
+                        "Sole",
+                    )
+                ),
+                "voting_shared": parse_int(
+                    find_direct_child_text(
+                        voting_authority,
+                        "Shared",
+                    )
+                ),
+                "voting_none": parse_int(
+                    find_direct_child_text(
+                        voting_authority,
+                        "None",
+                    )
+                ),
+            }
+        )
+
+    return holdings
+
+
+FILINGS_SCHEMA = pa.schema([
+    ("accession_number", pa.string(), False),
+    ("cik", pa.string(), False),
+    ("fund_name", pa.string(), False),
+    ("filing_manager", pa.string(), False),
+    ("form_type", pa.string(), False),
+    ("report_period", pa.date32(), False),
+    ("report_quarter", pa.string(), False),
+    ("filing_date", pa.date32(), False),
+    ("is_amendment", pa.bool_(), False),
+    ("amendment_no", pa.int32(), True),
+    ("amendment_type", pa.string(), True),
+    ("report_type", pa.string(), False),
+    ("form_13f_file_number", pa.string(), True),
+    ("crd_number", pa.string(), True),
+    ("sec_file_number", pa.string(), True),
+    ("other_included_managers_count", pa.int32(), True),
+    ("table_entry_total", pa.int64(), True),
+    ("table_value_total", pa.int64(), True),
+])
+
+
+HOLDINGS_SCHEMA = pa.schema([
+    ("accession_number", pa.string(), False),
+    ("cik", pa.string(), False),
+    ("report_quarter", pa.string(), False),
+    ("name_of_issuer", pa.string(), False),
+    ("title_of_class", pa.string(), False),
+    ("cusip", pa.string(), False),
+    ("figi", pa.string(), True),
+    ("value", pa.int64(), False),
+    ("ssh_prnamt", pa.int64(), False),
+    ("ssh_prnamt_type", pa.string(), False),
+    ("put_call", pa.string(), True),
+    ("investment_discretion", pa.string(), False),
+    ("other_manager", pa.string(), True),
+    ("voting_sole", pa.int64(), False),
+    ("voting_shared", pa.int64(), False),
+    ("voting_none", pa.int64(), False),
+])
+
+
 def run(user_agent: str, output: Path) -> None:
     """Build the dataset."""
 
@@ -403,6 +992,111 @@ def run(user_agent: str, output: Path) -> None:
         f"\nFound all {len(all_filings)} expected "
         f"in-scope filings"
     )
+
+    filing_rows = []
+    holding_rows = []
+    downloaded_files = []
+
+    for filing in all_filings:
+        primary_path, info_path = get_filing_documents(
+            filing,
+            user_agent,
+        )
+
+        # Choose the canonical XML required in output/filings.
+        if filing["form"] in {"13F-NT", "13F-NT/A"}:
+            source_path = primary_path
+        else:
+            if info_path is None:
+                raise ValueError(
+                    f"Missing information table for "
+                    f"{filing['accession_number']}"
+                )
+
+            source_path = info_path
+
+        cik = filing["cik"]
+        accession_nodashes = (
+            filing["accession_number"].replace("-", "")
+        )
+
+        destination_dir = output / "filings" / cik
+        destination_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        destination = (
+            destination_dir
+            / f"{accession_nodashes}.xml"
+        )
+
+        if not destination.exists():
+            destination.write_bytes(
+                source_path.read_bytes()
+            )
+
+        downloaded_files.append(destination)
+
+        filing_row = parse_filing_cover(
+            filing,
+            primary_path,
+        )
+
+        filing_rows.append(filing_row)
+
+        holding_rows.extend(
+            parse_holdings(
+                filing_row,
+                info_path,
+            )
+        )
+
+    print(
+        f"\nDownloaded or reused "
+        f"{len(downloaded_files)} filing XML files"
+    )
+
+    print(
+        f"\nParsed {len(filing_rows)} filings "
+        f"and {len(holding_rows)} holdings"
+    )
+
+    if len(filing_rows) != 40:
+        raise ValueError(
+            f"Expected 40 parsed filings, "
+            f"found {len(filing_rows)}"
+        )
+
+
+    filings_table = pa.Table.from_pylist(
+        filing_rows,
+        schema=FILINGS_SCHEMA,
+    )
+
+    holdings_table = pa.Table.from_pylist(
+        holding_rows,
+        schema=HOLDINGS_SCHEMA,
+    )
+
+    pq.write_table(
+        filings_table,
+        output / "filings.parquet",
+        compression="snappy",
+    )
+
+    pq.write_table(
+        holdings_table,
+        output / "holdings.parquet",
+        compression="snappy",
+    )
+
+    print(
+        "\nWrote:"
+        f"\n  {output / 'filings.parquet'}"
+        f"\n  {output / 'holdings.parquet'}"
+    )
+    
 
 
 def main() -> int:
