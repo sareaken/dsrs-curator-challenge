@@ -16,7 +16,7 @@ Upload to Illinois MediaSpace: https://mediaspace.illinois.edu/upload/media
 
 Set visibility to **Unlisted**.
 
-- **Link:** https://mediaspace.illinois.edu/media/t/1_ru8kxsy2
+- **Link:** https://mediaspace.illinois.edu/media/t/1_vd6e4qc7
 
 ## Chapters attempted
 
@@ -32,15 +32,15 @@ Mark what you completed. Partial work still gets read.
 
 ## Checklist
 
-- [ ] `python check_submission.py` passes
-- [ ] Repo is **private** and `dsrsBOT` is a collaborator with Read access
+- [x] `python check_submission.py` passes
+- [x] Repo is **private** and `dsrsBOT` is a collaborator with Read access
 - [x] Video uploaded to MediaSpace, visibility **Unlisted**, link tested
-- [ ] Repository URL submitted at https://ikompete.dsrs.illinois.edu/competition/16
+- [x] Repository URL submitted at https://ikompete.dsrs.illinois.edu/competition/16
 - [x] `python verify.py` passes
 - [x] Pipeline run twice; output is byte-identical
 - [x] `output/filings.parquet`, `output/holdings.parquet` committed
 - [x] `output/filers.csv`, `output/filings/`, `submission/eda.py` committed
-- [ ] `DEPENDENCIES.md`, `AI_USAGE.md`, and `ASSUMPTIONS.md` filled in
+- [x] `DEPENDENCIES.md`, `AI_USAGE.md`, and `ASSUMPTIONS.md` filled in
 - [x] No API keys, tokens, or credentials committed
 - [ ] Frozen files unmodified
 

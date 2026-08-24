@@ -8,12 +8,13 @@ one deliberately.
 
 | Library | Version | Why |
 |---|---|---|
-| *example* | *2.1.0* | *replace this row* |
+| None | — | No additional dependencies were required beyond those provided by the project. |
 
 ## Anything you considered and rejected
 
-Optional, but the more interesting half. A library you looked at and decided against —
-and why — says more than the ones you kept.
+No additional libraries were necessary. I used the provided project dependencies and
+standard-library functionality rather than adding an end-to-end 13F retrieval or parsing
+library, which kept the ingestion and parsing behavior explicit and auditable.
 
 ## Note
 
