@@ -389,8 +389,8 @@ def largest_position(
     fund_name, value = winner
 
     return {
-        "answer": value,
-        "unit": "USD",
+        "answer": fund_name,
+        "unit": "NAME",
         "sources": sorted(sources[fund_name]),
     }
 
@@ -519,12 +519,8 @@ def largest_change(
     )
 
     return {
-        "answer": change,
-        "unit": (
-            "SHARES"
-            if metric == "shares"
-            else "USD"
-        ),
+        "answer": fund_name,
+        "unit": "NAME",
         "sources": source_list,
     }
 
